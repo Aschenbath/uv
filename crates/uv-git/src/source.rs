@@ -54,16 +54,26 @@ impl GitSource {
     pub(crate) fn fetch(self) -> Result<Fetch> {
         let lfs_requested = self.git.lfs().enabled();
 
-        // The path to the repo, within the Git database.
-        let ident = cache_digest(self.git.repository());
-        let db_path = self.cache.join("db").join(&ident);
-
-        // Authenticate the URL, if necessary.
         let remote = if let Some(credentials) = GIT_STORE.get(self.git.repository()) {
             Cow::Owned(credentials.apply(self.git.url().clone()))
         } else {
             Cow::Borrowed(self.git.url())
         };
+        let ident = cache_digest(self.git.repository());
+        let database = Path::new("db").join(&ident);
+        let partial = self.cache.join("partial");
+        // Older cache readers require complete repositories. Git directory conditions can also
+        // select different mirrors for the partial and full databases.
+        let git_remote = GitRemote::new(remote.clone().into_owned());
+        let (cache, settings, db) = if let Some((settings, db)) =
+            git_remote.partial_db(&partial.join(&database), &self.settings)?
+        {
+            (partial, settings, db)
+        } else {
+            let db = git_remote.db_at(&self.cache.join(&database), &self.settings)?;
+            (self.cache, self.settings, db)
+        };
+        let db_path = cache.join(database);
 
         // Cache LFS and plain Git checkouts separately because their worktrees can differ.
         let checkout_ident = if lfs_requested {
@@ -71,7 +81,7 @@ impl GitSource {
         } else {
             ident
         };
-        let checkouts = self.cache.join("checkouts").join(checkout_ident);
+        let checkouts = cache.join("checkouts").join(checkout_ident);
         let copy_to = |db: GitDatabase, rev: GitOid, path: PathBuf| -> Result<Fetch> {
             let git = self.git.clone().with_precise(rev)?;
             let checkout = db.copy_to(rev, &path)?;
@@ -82,11 +92,7 @@ impl GitSource {
             })
         };
 
-        let git_remote = GitRemote::new(remote.clone().into_owned());
-        let maybe_db = match (
-            self.git.precise(),
-            git_remote.db_at(&db_path, &self.settings)?,
-        ) {
+        let maybe_db = match (self.git.precise(), db) {
             (Some(rev), Some(db)) if db.contains(rev) => {
                 let path = checkouts.join(db.to_short_id(rev)?);
                 // A completed checkout can serve this revision without reading the shared LFS store.
@@ -115,7 +121,7 @@ impl GitSource {
             maybe_db,
             self.git.reference(),
             self.git.precise(),
-            &self.settings,
+            &settings,
             lfs_requested,
         )?;
         // Git's abbreviated revision keeps checkout paths short on Windows.

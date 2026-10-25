@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf, absolute};
 use std::str::{self};
 use std::sync::LazyLock;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use cargo_util::{ProcessBuilder, ProcessError, paths};
 use owo_colors::OwoColorize;
 use percent_encoding::{CONTROLS, percent_encode};
@@ -14,6 +14,7 @@ use tracing::{debug, instrument, warn};
 use uv_auth::TrustedHost;
 use uv_fs::Simplified;
 use uv_git_types::{GitOid, GitReference};
+use uv_preview::PreviewFeature;
 use uv_redacted::SafeUrl;
 use uv_static::EnvVars;
 use uv_warnings::warn_user_once;
@@ -29,6 +30,12 @@ const LFS_READY: &[u8] = b"lfs-v2";
 const LFS_UNCHECKED: &[u8] = b"lfs-v2-unchecked";
 /// Git pathspec for files with the `filter=lfs` attribute.
 const LFS_PATHSPEC: &str = ":(attr:filter=lfs)";
+
+/// Filter used for partial Git fetches.
+const PARTIAL_CLONE_FILTER: &str = "tree:0";
+
+/// Remote configured for local checkout clones.
+const CHECKOUT_REMOTE: &str = "origin";
 
 #[derive(Debug, thiserror::Error)]
 pub enum GitError {
@@ -118,6 +125,8 @@ pub(crate) struct GitRepository {
     path: PathBuf,
     /// Worktree containing the selected revision's `.lfsconfig` for Git LFS commands.
     lfs_worktree: Option<tempfile::TempDir>,
+    /// Whether this instance was created by [`Self::init`].
+    newly_initialized: bool,
 }
 
 /// The most severe validation outcome determines the marker for the entire checkout.
@@ -133,6 +142,7 @@ impl GitRepository {
         Self {
             path: path.to_path_buf(),
             lfs_worktree: None,
+            newly_initialized: false,
         }
     }
 
@@ -163,7 +173,10 @@ impl GitRepository {
             .cwd(path)
             .exec_with_output()?;
 
-        Ok(Self::at(path))
+        Ok(Self {
+            newly_initialized: true,
+            ..Self::at(path)
+        })
     }
 
     /// Provide the revision's `.lfsconfig` to Git LFS in a temporary worktree.
@@ -228,14 +241,54 @@ impl GitRepository {
         result.with_context(|| format!("failed to find {} `{reference}`", reference.kind_str()))
     }
 
-    /// Parses the object ID of the given `refname`.
-    fn rev_parse(&self, refname: &str) -> Result<GitOid> {
+    /// Returns whether a promisor remote is configured for this repository.
+    fn has_promisor_remote(&self) -> Result<bool> {
         let result = GIT
             .as_ref()
             .cloned()?
-            .args(&["--git-dir=.git", "rev-parse", refname])
+            .arg("config")
+            .arg("--bool")
+            .arg("--get-regexp")
+            .arg(r"^remote\..*\.promisor$")
+            .cwd(&self.path)
+            .exec_with_output();
+        match result {
+            Ok(output) => Ok(str::from_utf8(&output.stdout)?
+                .lines()
+                .any(|line| line.ends_with(" true"))),
+            Err(error)
+                if error
+                    .downcast_ref::<ProcessError>()
+                    .is_some_and(|error| error.code == Some(1)) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn set_remote_url(&self, url: &SafeUrl) -> Result<()> {
+        GIT.as_ref()
+            .cloned()?
+            .arg("config")
+            .arg(format!("remote.{CHECKOUT_REMOTE}.url"))
+            .arg(url.without_credentials().as_str())
             .cwd(&self.path)
             .exec_with_output()?;
+        Ok(())
+    }
+
+    /// Parses the object ID of the given `refname`.
+    fn rev_parse(&self, refname: &str) -> Result<GitOid> {
+        let mut command = GIT.as_ref().cloned()?;
+        command.args(&["--git-dir=.git", "rev-parse", refname]);
+        if uv_preview::is_enabled(PreviewFeature::GitPartialFetches) {
+            // Revision probes must not fetch missing objects. Older Git ignores `GIT_NO_LAZY_FETCH`.
+            command
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .env(EnvVars::GIT_ALLOW_PROTOCOL, "");
+        }
+        let result = command.cwd(&self.path).exec_with_output()?;
 
         let mut result = String::from_utf8(result.stdout)?;
         result.truncate(result.trim_end().len());
@@ -549,6 +602,10 @@ impl GitRepository {
             return LfsValidation::Failed;
         };
 
+        if uv_preview::is_enabled(PreviewFeature::GitPartialFetches) {
+            cmd.env("GIT_NO_LAZY_FETCH", "1")
+                .env(EnvVars::GIT_ALLOW_PROTOCOL, "file");
+        }
         // Requires Git LFS 3.x (2021 release)
         let result = cmd
             .arg("fsck")
@@ -686,6 +743,37 @@ impl GitRemote {
             lfs_ready: None,
         })
     }
+
+    /// Select the partial cache when preview and transport settings permit it.
+    pub(crate) fn partial_db(
+        &self,
+        path: &Path,
+        settings: &GitHttpSettings,
+    ) -> Result<Option<(GitHttpSettings, Option<GitDatabase>)>> {
+        // Lazy fetches cannot use uv's transient credentials or TLS exceptions. A query may carry
+        // credentials even when the URL has no username or password.
+        if !uv_preview::is_enabled(PreviewFeature::GitPartialFetches)
+            || settings.disable_ssl(&self.url)
+            || self.url.query_pairs().next().is_some()
+            || self.url.without_credentials().as_str() != self.url.as_str()
+        {
+            return Ok(None);
+        }
+        let mut settings = settings.clone();
+        settings.partial_fetches = true;
+        let mut db = self.db_at(path, &settings)?;
+        // A template or Git directory condition can select a trusted mirror on the first fetch.
+        if db.is_none() && settings.has_named_tls_exceptions() {
+            db = Some(self.init_db(path, &settings)?);
+        }
+        if db
+            .as_ref()
+            .is_some_and(|db| db.settings.trusted_mirror.is_some())
+        {
+            return Ok(None);
+        }
+        Ok(Some((settings, db)))
+    }
 }
 
 impl GitDatabase {
@@ -806,6 +894,18 @@ impl GitCheckout {
         let mut clone = GIT.as_ref().cloned()?;
         // Defer checkout until reset applies the requested transport settings.
         clone.args(&["clone", "--no-checkout"]);
+        let settings = &database.settings;
+        if settings.partial_fetches {
+            // Cache this revision's trees and blobs for local clones, including offline reuse.
+            fetch_checkout_objects(&database.repo, database.remote.url(), &revision, settings)?;
+            clone
+                .arg("--config")
+                .arg(format!("remote.{CHECKOUT_REMOTE}.promisor=true"))
+                .arg("--config")
+                .arg(format!(
+                    "remote.{CHECKOUT_REMOTE}.partialclonefilter={PARTIAL_CLONE_FILTER}"
+                ));
+        }
         let res = clone
             .clone()
             .arg("--local")
@@ -949,6 +1049,9 @@ impl GitCheckout {
         let original_remote_url = database.remote.url();
         let settings = &database.settings;
 
+        if settings.partial_fetches {
+            self.repo.set_remote_url(original_remote_url)?;
+        }
         // We want to skip smudge if lfs was disabled for the repository
         // as smudge filters can trigger on a reset even if lfs artifacts
         // were not originally "fetched".
@@ -1308,6 +1411,11 @@ fn fetch_with_cli(
     tags: bool,
     settings: &GitHttpSettings,
 ) -> Result<()> {
+    let partial_fetches = settings.partial_fetches;
+    if partial_fetches {
+        // A named remote lets Git record the promisor and default filter.
+        repo.set_remote_url(url)?;
+    }
     let mut cmd = configure_git_network(GIT.as_ref().cloned()?, url, settings);
 
     cmd.arg("fetch");
@@ -1315,10 +1423,15 @@ fn fetch_with_cli(
         cmd.arg("--tags");
     }
     cmd.arg("--force") // handle force pushes
-        .arg("--update-head-ok") // see discussion in #2078
-        .arg(url.as_str())
-        .args(refspecs)
-        .cwd(&repo.path);
+        .arg("--update-head-ok"); // see discussion in #2078
+    if partial_fetches {
+        // Build tools can require full commit history, while trees and blobs are fetched as needed.
+        cmd.arg(format!("--filter={PARTIAL_CLONE_FILTER}"))
+            .arg(CHECKOUT_REMOTE);
+    } else {
+        cmd.arg(url.as_str());
+    }
+    cmd.args(refspecs).cwd(&repo.path);
 
     // We capture the output to avoid streaming it to the user's console during clones.
     // The required `on...line` callbacks currently do nothing.
@@ -1374,6 +1487,98 @@ fn quote_git_config(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''").replace('!', "'\\!'"))
 }
 
+/// Fetch one revision's trees and blobs in batches, without traversing its history.
+fn fetch_checkout_objects(
+    repo: &GitRepository,
+    url: &SafeUrl,
+    revision: &GitOid,
+    settings: &GitHttpSettings,
+) -> Result<()> {
+    let mut requested = Vec::new();
+    loop {
+        let output = GIT
+            .as_ref()
+            .cloned()?
+            .arg("rev-list")
+            .arg("--objects")
+            .arg("--no-object-names")
+            .arg("--missing=print")
+            .arg("--no-walk")
+            .arg(revision.as_str())
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .env(EnvVars::GIT_ALLOW_PROTOCOL, "file")
+            .cwd(&repo.path)
+            .exec_with_output()?;
+        let mut missing = str::from_utf8(&output.stdout)?
+            .lines()
+            .filter_map(|line| line.strip_prefix('?'))
+            .map(str::parse::<GitOid>)
+            .collect::<Result<Vec<_>, _>>()?;
+        if missing.is_empty() {
+            return Ok(());
+        }
+        missing.sort_unstable();
+        ensure!(
+            missing != requested,
+            "Git did not provide the objects required by {revision}"
+        );
+
+        // The initial filtered fetch already set the remote on a new database.
+        if requested.is_empty() && !repo.newly_initialized {
+            repo.set_remote_url(url)?;
+        }
+        let mut fetch = configure_git_network(GIT.as_ref().cloned()?, url, settings);
+        fetch
+            .arg("fetch")
+            .arg("--no-tags")
+            .arg("--no-recurse-submodules")
+            .cwd(&repo.path);
+        // Avoid advertising cached commits as complete when their trees or blobs may be missing.
+        let mut batch = fetch.clone();
+        append_git_config(&mut batch, "fetch.negotiationAlgorithm", "noop");
+        let object_ids = missing.iter().map(GitOid::as_str).collect::<Vec<_>>();
+        // For a newly initialized database, request missing trees and their blobs together
+        // to reduce fetch round trips.
+        let filter = if repo.newly_initialized {
+            "--no-filter"
+        } else {
+            "--filter=blob:none"
+        };
+        let result = batch
+            .arg(filter)
+            .arg("--stdin")
+            .arg(CHECKOUT_REMOTE)
+            .stdin(object_ids.join("\n"))
+            .exec_with_output();
+        if let Err(err) = result {
+            // Git before 2.29 rejects `--stdin` with status 129. If it exits before uv
+            // finishes writing the object IDs, uv can see a broken pipe before the exit status.
+            let usage_error =
+                err.downcast_ref::<ProcessError>().and_then(|err| err.code) == Some(129);
+            let broken_pipe = err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|err| err.kind() == std::io::ErrorKind::BrokenPipe);
+            if !usage_error && !broken_pipe {
+                return Err(git_command_error(err, url, settings.offline));
+            }
+            // Pass the object IDs as arguments and fetch complete subtrees to reduce requests.
+            // No valid ref contains "..", so the glob offers no haves.
+            fetch
+                .arg("--negotiation-tip=refs/*..*")
+                .arg("--no-filter")
+                .arg(CHECKOUT_REMOTE);
+            for objects in object_ids.chunks(256) {
+                fetch
+                    .clone()
+                    .args(objects)
+                    .exec_with_output()
+                    .map_err(|err| git_command_error(err, url, settings.offline))?;
+            }
+        }
+        requested = missing;
+    }
+}
+
 #[derive(Clone, Copy)]
 enum LfsSource<'a> {
     Remote(&'a SafeUrl, &'a GitHttpSettings),
@@ -1392,6 +1597,14 @@ fn fetch_lfs(repo: &GitRepository, revision: &GitOid, source: LfsSource<'_>) -> 
     };
 
     let local_settings = GitHttpSettings::default().with_offline(true);
+    // Make the selected revision's Git trees and blobs available before Git LFS scans for pointers.
+    if uv_preview::is_enabled(PreviewFeature::GitPartialFetches) && repo.has_promisor_remote()? {
+        let (url, settings) = match source {
+            LfsSource::Remote(url, settings) => (url, settings),
+            LfsSource::Local(url) => (url, &local_settings),
+        };
+        fetch_checkout_objects(repo, url, revision, settings)?;
+    }
     let config_repo = match source {
         LfsSource::Remote(..) => Some(repo.for_lfs_revision(revision)?),
         LfsSource::Local(_) => None,
@@ -1707,9 +1920,15 @@ mod tests {
             .open(directory.path().join(".git/config"))?
             .write_all(b"\n[url \"https://mirror.example:9443/\xff/\"]\n\tinsteadOf = https://source.example/\n")?;
         let source = SafeUrl::parse("https://source.example/project.git")?;
-        let settings = GitHttpSettings::default()
-            .with_insecure_hosts(vec!["mirror.example".parse()?])
-            .for_remote(&source, directory.path())?;
+        let settings =
+            GitHttpSettings::default().with_insecure_hosts(vec!["mirror.example".parse()?]);
+        let _preview = uv_preview::test::with_features(&[PreviewFeature::GitPartialFetches]);
+        assert!(
+            GitRemote::new(source.clone())
+                .partial_db(directory.path(), &settings)?
+                .is_none()
+        );
+        let settings = settings.for_remote(&source, directory.path())?;
 
         // An unqualified host also matches a rewritten URL on a non-default port.
         let command = configure_git_network(git, &source, &settings);

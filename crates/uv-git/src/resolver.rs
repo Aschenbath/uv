@@ -68,6 +68,8 @@ pub struct GitHttpSettings {
     pub(crate) offline: bool,
     /// An HTTPS mirror explicitly trusted by the caller after Git rewrites the source URL.
     pub(crate) trusted_mirror: Option<SafeUrl>,
+    /// Whether this database uses the partial-fetch cache.
+    pub(crate) partial_fetches: bool,
 }
 
 impl GitHttpSettings {
